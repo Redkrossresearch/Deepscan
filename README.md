@@ -5,7 +5,7 @@
 **Detect AI-generated images and deepfake videos using a CNN + ViT ensemble pipeline.**
 
 [![Backend](https://img.shields.io/badge/Backend-Hugging%20Face%20Spaces-FFD21E?style=flat-square&logo=huggingface)](https://huggingface.co/spaces/sanjay72005/deepscan)
-[![Frontend](https://img.shields.io/badge/Frontend-Netlify-00C7B7?style=flat-square&logo=netlify)](https://deepscan.netlify.app)
+[![Frontend](https://img.shields.io/badge/Frontend-Netlify-00C7B7?style=flat-square&logo=netlify)](https://deepscanbot.netlify.app/)
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 
