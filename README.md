@@ -419,6 +419,6 @@ This project is licensed under the **MIT License** — see [LICENSE](LICENSE) fo
 
 Made with ❤️ by [Sanjay](https://github.com/Sanjay20057)
 
-**[🌐 Live Demo](https://deepscan.netlify.app)** · **[🤗 Backend API](https://huggingface.co/spaces/sanjay72005/deepscan)** · **[📦 Dataset (Images)](https://www.kaggle.com/datasets/prithivsakthiur/deepfake-vs-real-60k)** · **[📦 Dataset (Videos)](https://github.com/ondyari/FaceForensics)**
+**[🌐 Live Demo](https://deepscanbot.netlify.app)** · **[🤗 Backend API](https://huggingface.co/spaces/sanjay72005/deepscan)** · **[📦 Dataset (Images)](https://www.kaggle.com/datasets/prithivsakthiur/deepfake-vs-real-60k)** · **[📦 Dataset (Videos)](https://github.com/ondyari/FaceForensics)**
 
 </div>
