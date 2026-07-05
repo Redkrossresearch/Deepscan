@@ -1,17 +1,24 @@
 """
-video_api.py — FastAPI backend for video deepfake detection (CNN-Only)
-FIXES APPLIED:
-1. Added /diagnose endpoint to print raw sigmoid values — run this first to
-   confirm whether fake_prob = 1-sigmoid or fake_prob = sigmoid is correct
-   for YOUR specific model weights.
-2. Preprocessing now matches standard MobileNetV2 training:
-   - Uses tf.keras.applications.mobilenet_v2.preprocess_input()
-     which scales pixels to [-1, 1] (NOT just /255.0)
-3. Added INVERT_SIGMOID flag — if your model outputs HIGH=FAKE (not HIGH=REAL),
-   set this to False in your .env:  INVERT_SIGMOID=false
-4. Softened threshold logic: added LOW_CONFIDENCE_ZONE so borderline cases
-   (40%-60%) are flagged as uncertain rather than hard FAKE.
-5. Better error messages and logging.
+video_api.py — FastAPI backend for deepfake detection
+Image path -> deepfake_model.keras (from-scratch CNN, 128x128, /255.0)
+Video path -> deepfake_model.h5    (MobileNetV2 transfer model, 224x224, preprocess_input)
+WHY TWO MODELS:
+Inspecting the two uploaded files shows they are NOT the same architecture:
+  - deepfake_model.keras is the custom from-scratch CNN (no pretrained backbone),
+    with an input layer of (128, 128, 3).
+  - deepfake_model.h5 is the earlier MobileNetV2 transfer-learning model, with an
+    input layer of (224, 224, 3) and a nested "mobilenetv2_1.00_224" submodel.
+This is exactly why IMAGE_INVERT_SIGMOID and VIDEO_INVERT_SIGMOID have different
+defaults below — they aren't two settings for one model, they're the correct
+sigmoid convention for two different models trained separately.
+FIXES CARRIED OVER FROM THE PREVIOUS PASS:
+- /diagnose no longer crashes (_raw_to_fake_prob was missing its `invert` arg).
+- `transformers` import is optional so a missing package doesn't take down
+  the whole API.
+- IMG_SIZE for each model is read from that model's own input_shape rather
+  than a hardcoded constant, so this can't silently drift again.
+Everything else — thresholds, video frame sampling/aggregation, response
+shapes — is unchanged from your version.
 Run with:  uvicorn video_api:app --host 0.0.0.0 --port 8000 --reload
 """
 
@@ -29,114 +36,159 @@ from typing import Optional
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from transformers import pipeline as hf_pipeline
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from PIL import Image
+
+# transformers is optional — the HF ViT ensemble is a bonus for the image
+# path only. A missing package shouldn't take down the whole API.
+try:
+    from transformers import pipeline as hf_pipeline
+    _HF_AVAILABLE = True
+except ImportError:
+    hf_pipeline = None
+    _HF_AVAILABLE = False
 
 load_dotenv()
 
 hf_detector = None
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
-IMG_SIZE          = 224
 THUMBNAIL_MAX_DIM = 240
 FRAMES_PER_VIDEO  = int(os.getenv("FRAMES_PER_VIDEO", "25"))
-FAKE_THRESHOLD       = float(os.getenv("FAKE_THRESHOLD", "0.40"))        # video threshold (kept for compat)
+FAKE_THRESHOLD       = float(os.getenv("FAKE_THRESHOLD", "0.40"))        # kept for compat
 IMAGE_FAKE_THRESHOLD = float(os.getenv("IMAGE_FAKE_THRESHOLD", "0.35"))  # image: flag fake if fake_prob >= 0.35
 VIDEO_FAKE_THRESHOLD = float(os.getenv("VIDEO_FAKE_THRESHOLD", "0.50"))  # video threshold
 
-# ── INVERT_SIGMOID — both image and video use True (HIGH sigmoid = REAL) ──────
-# Your model outputs HIGH = REAL for both media types.
-# For images we compensate with a very low threshold (0.15) instead.
+# ── INVERT_SIGMOID — unchanged, exactly as specified ─────────────────────────
 IMAGE_INVERT_SIGMOID = os.getenv("IMAGE_INVERT_SIGMOID", "false").lower() != "false"
 VIDEO_INVERT_SIGMOID = os.getenv("VIDEO_INVERT_SIGMOID", "true").lower() != "false"
 
-# Legacy alias
-INVERT_SIGMOID = IMAGE_INVERT_SIGMOID
+# ── Per-model preprocessing ───────────────────────────────────────────────────
+# Hardcoded to match each model's own architecture (not an env-configurable
+# global anymore, since image and video now use two different models):
+#   image model (from-scratch CNN)  -> divide by 255  -> [0, 1]
+#   video model (MobileNetV2)       -> preprocess_input -> [-1, 1]
+IMAGE_PREPROCESS_MODE = "divide255"
+VIDEO_PREPROCESS_MODE = "mobilenet"
 
-# ── PREPROCESSING MODE ────────────────────────────────────────────────────────
-# "mobilenet"  → uses preprocess_input() scaling to [-1, 1]  ← CORRECT for MobileNetV2
-# "divide255"  → old behaviour: just divide by 255
-PREPROCESS_MODE   = os.getenv("PREPROCESS_MODE", "mobilenet")
+# IMG_SIZE fallbacks only — both are overwritten with the real value read off
+# each model's input_shape in _load_models().
+IMAGE_IMG_SIZE = 128
+VIDEO_IMG_SIZE = 224
 
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "deepfake_model.h5")
+IMAGE_MODEL_PATH = os.path.join(os.path.dirname(__file__), "deepfake_model.keras")
+VIDEO_MODEL_PATH = os.path.join(os.path.dirname(__file__), "deepfake_model.h5")
 
 SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/webp"}
 VIDEO_EXTENSIONS      = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv"}
 
 # ─── GLOBALS ─────────────────────────────────────────────────────────────────
-model          = None
+image_model    = None
+video_model    = None
 _startup_error = ""
-_preprocess_fn = None   # set during model load
+_mobilenet_preprocess_fn = None  # set during model load, used for the video model only
+
 
 # ─── MODEL LOADING ───────────────────────────────────────────────────────────
-def _load_model():
-    global model, _preprocess_fn, hf_detector
+def _load_models():
+    global image_model, video_model, hf_detector, _mobilenet_preprocess_fn
+    global IMAGE_IMG_SIZE, VIDEO_IMG_SIZE
     import tensorflow as tf
 
-    if not os.path.exists(MODEL_PATH):
+    # -- Image model (from-scratch CNN) --------------------------------------
+    if not os.path.exists(IMAGE_MODEL_PATH):
         raise RuntimeError(
-            f"Model file '{MODEL_PATH}' not found.\n"
-            "Fix: copy deepfake_model.h5 to the same directory as video_api.py"
+            f"Image model file '{IMAGE_MODEL_PATH}' not found.\n"
+            f"Fix: copy your trained model to this directory as "
+            f"'{os.path.basename(IMAGE_MODEL_PATH)}'."
         )
+    image_model = tf.keras.models.load_model(IMAGE_MODEL_PATH)
+    IMAGE_IMG_SIZE = _infer_img_size(image_model, IMAGE_IMG_SIZE, "image")
 
-    model = tf.keras.models.load_model(MODEL_PATH)
-
-    # ── HuggingFace ViT detector ──────────────────────────────
-    try:
-        hf_detector = hf_pipeline(
-            "image-classification",
-            model="Wvolf/ViT_Deepfake_Detection",
-            device=-1  # CPU
+    # -- Video model (MobileNetV2 transfer model) ----------------------------
+    if not os.path.exists(VIDEO_MODEL_PATH):
+        raise RuntimeError(
+            f"Video model file '{VIDEO_MODEL_PATH}' not found.\n"
+            f"Fix: copy your trained model to this directory as "
+            f"'{os.path.basename(VIDEO_MODEL_PATH)}'."
         )
-        print("✅ HuggingFace ViT detector loaded")
-    except Exception as e:
-        print(f"⚠️ HuggingFace detector failed to load: {e}")
+    video_model = tf.keras.models.load_model(VIDEO_MODEL_PATH)
+    VIDEO_IMG_SIZE = _infer_img_size(video_model, VIDEO_IMG_SIZE, "video")
 
-    # ── Preprocessing ─────────────────────────────────────────
-    if PREPROCESS_MODE == "mobilenet":
-        from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
-        _preprocess_fn = preprocess_input
-        print("✅ Preprocessing: MobileNetV2 preprocess_input [-1, 1]")
+    from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+    _mobilenet_preprocess_fn = preprocess_input
+
+    # -- HuggingFace ViT detector (optional, image path only) ----------------
+    if _HF_AVAILABLE:
+        try:
+            hf_detector = hf_pipeline(
+                "image-classification",
+                model="Wvolf/ViT_Deepfake_Detection",
+                device=-1  # CPU
+            )
+            print("HuggingFace ViT detector loaded")
+        except Exception as e:
+            print(f"HuggingFace detector failed to load: {e}")
     else:
-        _preprocess_fn = None
-        print("✅ Preprocessing: divide by 255 [0, 1]")
+        print("'transformers' not installed -- image path is CNN-only (no HF ensemble).")
 
-    print(f"✅ Model loaded from '{MODEL_PATH}'")
-    print(f"   IMAGE_INVERT_SIGMOID  = {IMAGE_INVERT_SIGMOID}")
-    print(f"   VIDEO_INVERT_SIGMOID  = {VIDEO_INVERT_SIGMOID}")
-    print(f"   IMAGE_FAKE_THRESHOLD  = {IMAGE_FAKE_THRESHOLD}")
-    print(f"   VIDEO_FAKE_THRESHOLD  = {VIDEO_FAKE_THRESHOLD}")
-    print(f"   Input shape           = {model.input_shape}")
+    print(f"Image model loaded from '{IMAGE_MODEL_PATH}'  (size={IMAGE_IMG_SIZE}, "
+          f"preprocess={IMAGE_PREPROCESS_MODE}, invert={IMAGE_INVERT_SIGMOID})")
+    print(f"Video model loaded from '{VIDEO_MODEL_PATH}'  (size={VIDEO_IMG_SIZE}, "
+          f"preprocess={VIDEO_PREPROCESS_MODE}, invert={VIDEO_INVERT_SIGMOID})")
+    print(f"   IMAGE_FAKE_THRESHOLD = {IMAGE_FAKE_THRESHOLD}")
+    print(f"   VIDEO_FAKE_THRESHOLD = {VIDEO_FAKE_THRESHOLD}")
+
+    # -- Sanity checks (non-fatal) --------------------------------------------
+    try:
+        dummy_img = np.zeros((1, IMAGE_IMG_SIZE, IMAGE_IMG_SIZE, 3), dtype=np.float32) / 255.0
+        raw_img   = float(image_model(dummy_img, training=False).numpy()[0][0])
+        print(f"   Image sanity check: raw_sigmoid={raw_img:.4f}  "
+              f"fake_prob={_raw_to_fake_prob(raw_img, IMAGE_INVERT_SIGMOID):.4f}")
+    except Exception as e:
+        print(f"   Image sanity check failed (non-fatal): {e}")
 
     try:
-        dummy    = np.zeros((1, IMG_SIZE, IMG_SIZE, 3), dtype=np.float32)
-        dummy_in = _preprocess_fn(dummy.copy()) if PREPROCESS_MODE == "mobilenet" else dummy
-        raw_out  = float(model(dummy_in, training=False).numpy()[0][0])
-        print(f"   Sanity check: raw_sigmoid={raw_out:.4f}  "
-              f"img_fake_prob={_raw_to_fake_prob(raw_out, IMAGE_INVERT_SIGMOID):.4f}  "
-              f"vid_fake_prob={_raw_to_fake_prob(raw_out, VIDEO_INVERT_SIGMOID):.4f}")
+        dummy_vid = _mobilenet_preprocess_fn(
+            np.zeros((1, VIDEO_IMG_SIZE, VIDEO_IMG_SIZE, 3), dtype=np.float32)
+        )
+        raw_vid = float(video_model(dummy_vid, training=False).numpy()[0][0])
+        print(f"   Video sanity check: raw_sigmoid={raw_vid:.4f}  "
+              f"fake_prob={_raw_to_fake_prob(raw_vid, VIDEO_INVERT_SIGMOID):.4f}")
     except Exception as e:
-        print(f"   Sanity check failed (non-fatal): {e}")
+        print(f"   Video sanity check failed (non-fatal): {e}")
+
+
+def _infer_img_size(model, fallback: int, label: str) -> int:
+    input_shape = model.input_shape  # e.g. (None, 128, 128, 3)
+    if input_shape and len(input_shape) == 4 and input_shape[1]:
+        detected = int(input_shape[1])
+        if detected != fallback:
+            print(f"{label} model expects {detected}px input "
+                  f"(config default was {fallback}px) -- using {detected}px.")
+        return detected
+    print(f"Could not infer {label} input size from input_shape={input_shape}; "
+          f"keeping fallback {fallback}px.")
+    return fallback
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _startup_error
     try:
-        _load_model()
+        _load_models()
     except Exception as exc:
         _startup_error = str(exc)
-        print(f"\n❌ Model failed to load:\n{_startup_error}\n")
+        print(f"\nModel failed to load:\n{_startup_error}\n")
     yield
 
 
 # ─── APP ─────────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="Deepfake Detection API (CNN-Only)",
-    version="2.0.0",
-    description="Pure CNN deepfake detection — MobileNetV2.",
+    title="Deepfake Detection API",
+    version="3.0.0",
+    description="Image path: from-scratch CNN. Video path: MobileNetV2 transfer model.",
     lifespan=lifespan,
 )
 app.add_middleware(
@@ -173,36 +225,29 @@ class AnalysisResponse(BaseModel):
 
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
-def _require_model():
-    if model is None:
+def _require_models():
+    if image_model is None or video_model is None:
         raise HTTPException(
             status_code=503,
             detail=(
-                "Model is not loaded. "
+                "Model(s) not loaded. "
                 + (_startup_error or "Check server logs.")
             ),
         )
 
 
-def _preprocess_pil(img: Image.Image) -> np.ndarray:
-    """
-    Resize PIL image to IMG_SIZE x IMG_SIZE and apply the correct preprocessing.
-    MobileNetV2 was trained expecting preprocess_input() which scales [0,255]
-    to [-1, 1]. Using plain /255.0 gives wrong inputs and causes the model to
-    output near-zero (or near-one) sigmoid values for EVERY image — which is
-    exactly the symptom of "all images classified as fake."
-    """
-    rgb = img.convert("RGB").resize((IMG_SIZE, IMG_SIZE), Image.LANCZOS)
-    arr = np.array(rgb, dtype=np.float32)   # shape (224, 224, 3), values 0–255
+def _preprocess_image_pil(img: Image.Image) -> np.ndarray:
+    """For the image model (from-scratch CNN): resize to IMAGE_IMG_SIZE, x/255.0 -> [0,1]."""
+    rgb = img.convert("RGB").resize((IMAGE_IMG_SIZE, IMAGE_IMG_SIZE), Image.LANCZOS)
+    arr = np.array(rgb, dtype=np.float32)
+    return arr / 255.0
 
-    if PREPROCESS_MODE == "mobilenet" and _preprocess_fn is not None:
-        # preprocess_input expects values in [0, 255] and returns [-1, 1]
-        arr = _preprocess_fn(arr)
-    else:
-        # legacy: normalise to [0, 1]
-        arr = arr / 255.0
 
-    return arr
+def _preprocess_video_pil(img: Image.Image) -> np.ndarray:
+    """For the video model (MobileNetV2): resize to VIDEO_IMG_SIZE, preprocess_input -> [-1,1]."""
+    rgb = img.convert("RGB").resize((VIDEO_IMG_SIZE, VIDEO_IMG_SIZE), Image.LANCZOS)
+    arr = np.array(rgb, dtype=np.float32)
+    return _mobilenet_preprocess_fn(arr)
 
 
 def _make_thumbnail(pil_img: Image.Image) -> str:
@@ -218,26 +263,25 @@ def _make_thumbnail(pil_img: Image.Image) -> str:
 
 def _raw_to_fake_prob(raw_sigmoid: float, invert: bool) -> float:
     """Convert raw sigmoid to fake probability.
-    invert=True  → fake_prob = 1 - sigmoid  (HIGH sigmoid = REAL, your model's behaviour)
-    invert=False → fake_prob = sigmoid
+    invert=True  -> fake_prob = 1 - sigmoid  (HIGH sigmoid = REAL)
+    invert=False -> fake_prob = sigmoid      (HIGH sigmoid = FAKE)
     """
     return (1.0 - raw_sigmoid) if invert else raw_sigmoid
 
 
 def predict_cnn_pil(pil_image: Image.Image) -> tuple[str, float, float]:
-    """Single IMAGE inference — CNN + ViT ensemble."""
-    
-    # ── CNN score ─────────────────────────────────────────────
-    arr       = _preprocess_pil(pil_image)
-    raw       = float(model(np.expand_dims(arr, 0), training=False).numpy()[0][0])
-    cnn_fake  = _raw_to_fake_prob(raw, invert=IMAGE_INVERT_SIGMOID)
+    """Single IMAGE inference — from-scratch CNN, optionally ensembled with HF ViT."""
 
-    # ── HuggingFace ViT score ──────────────────────────────────
+    # -- CNN score (image model) --------------------------------
+    arr      = _preprocess_image_pil(pil_image)
+    raw      = float(image_model(np.expand_dims(arr, 0), training=False).numpy()[0][0])
+    cnn_fake = _raw_to_fake_prob(raw, invert=IMAGE_INVERT_SIGMOID)
+
+    # -- HuggingFace ViT score (optional) -------------------------
     hf_fake = cnn_fake  # fallback if HF not loaded
     if hf_detector is not None:
         try:
             results = hf_detector(pil_image)
-            # Find the 'fake' label score
             for r in results:
                 if "fake" in r["label"].lower():
                     hf_fake = r["score"]
@@ -245,8 +289,7 @@ def predict_cnn_pil(pil_image: Image.Image) -> tuple[str, float, float]:
         except Exception as e:
             print(f"   [HF] inference failed: {e}")
 
-    # ── Ensemble: take the higher of the two ──────────────────
-    # If EITHER model thinks it's fake, flag it
+    # -- Ensemble: take the higher of the two --------------------
     fake_prob = max(cnn_fake, hf_fake)
 
     label = "fake" if fake_prob >= IMAGE_FAKE_THRESHOLD else "real"
@@ -260,11 +303,12 @@ def predict_cnn_pil(pil_image: Image.Image) -> tuple[str, float, float]:
 def predict_cnn_batch(
     pil_images: list[Image.Image],
 ) -> tuple[list[str], list[float], list[float]]:
-    """Batched VIDEO frame inference. Uses VIDEO_INVERT_SIGMOID + VIDEO_FAKE_THRESHOLD."""
+    """Batched VIDEO frame inference — MobileNetV2 model. Unchanged logic,
+    now just pointed at video_model / VIDEO_IMG_SIZE / mobilenet preprocessing."""
     if not pil_images:
         return [], [], []
-    batch = np.stack([_preprocess_pil(img) for img in pil_images])
-    raws  = model(batch, training=False).numpy().flatten()
+    batch = np.stack([_preprocess_video_pil(img) for img in pil_images])
+    raws  = video_model(batch, training=False).numpy().flatten()
 
     labels, confs, fake_probs = [], [], []
     for raw in raws:
@@ -298,75 +342,85 @@ def _frame_explanation(verdict: str, fake_prob: float,
 
 @app.get("/health")
 def health():
-    if model is None:
+    if image_model is None or video_model is None:
         return JSONResponse(
             status_code=503,
             content={
-                "status":       "error",
-                "model_loaded": False,
-                "error":        _startup_error or "Model not loaded",
+                "status":        "error",
+                "model_loaded":  False,  # legacy field the frontend's status badge checks
+                "models_loaded": False,
+                "error":         _startup_error or "Model(s) not loaded",
             },
         )
     return {
-        "status":          "ok",
-        "model_loaded":    True,
-        "model_file":      MODEL_PATH,
-        "invert_sigmoid":  INVERT_SIGMOID,
-        "preprocess_mode": PREPROCESS_MODE,
-        "fake_threshold":  FAKE_THRESHOLD,
-        "input_shape":     str(model.input_shape),
+        "status":               "ok",
+        "model_loaded":         True,   # legacy field the frontend's status badge checks
+        "models_loaded":        True,
+        "image_model_file":     IMAGE_MODEL_PATH,
+        "video_model_file":     VIDEO_MODEL_PATH,
+        "image_img_size":       IMAGE_IMG_SIZE,
+        "video_img_size":       VIDEO_IMG_SIZE,
+        "image_preprocess":     IMAGE_PREPROCESS_MODE,
+        "video_preprocess":     VIDEO_PREPROCESS_MODE,
+        "image_invert_sigmoid": IMAGE_INVERT_SIGMOID,
+        "video_invert_sigmoid": VIDEO_INVERT_SIGMOID,
+        "image_fake_threshold": IMAGE_FAKE_THRESHOLD,
+        "video_fake_threshold": VIDEO_FAKE_THRESHOLD,
+        "image_input_shape":    str(image_model.input_shape),
+        "video_input_shape":    str(video_model.input_shape),
+        "hf_ensemble_loaded":   hf_detector is not None,
     }
 
 
-# ── DIAGNOSTIC ENDPOINT ───────────────────────────────────────────────────────
+# ── DIAGNOSTIC ENDPOINT (image model only) ────────────────────────────────────
 @app.post("/diagnose")
 async def diagnose(file: UploadFile = File(...)):
     """
-    Upload any image here to see:
-    - raw sigmoid output
-    - fake_prob with current INVERT_SIGMOID setting
-    - what result you'd get if INVERT_SIGMOID were flipped
-    Use this to confirm whether your .env setting is correct.
+    Upload an image to see the raw sigmoid output from the IMAGE model and
+    what fake_prob would be under both invert settings.
     curl -X POST http://localhost:8000/diagnose -F "file=@your_image.jpg"
     """
-    _require_model()
+    _require_models()
     raw_bytes = await file.read()
     try:
         pil_image = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Cannot read image: {exc}")
 
-    arr = _preprocess_pil(pil_image)
-    raw = float(model(np.expand_dims(arr, 0), training=False).numpy()[0][0])
+    arr = _preprocess_image_pil(pil_image)
+    raw = float(image_model(np.expand_dims(arr, 0), training=False).numpy()[0][0])
 
-    fake_prob_current = _raw_to_fake_prob(raw)
-    fake_prob_flipped = raw if INVERT_SIGMOID else (1.0 - raw)
+    fake_prob_not_inverted = _raw_to_fake_prob(raw, invert=False)
+    fake_prob_inverted     = _raw_to_fake_prob(raw, invert=True)
 
-    verdict_current = "FAKE" if fake_prob_current >= FAKE_THRESHOLD else "REAL"
-    verdict_flipped = "FAKE" if fake_prob_flipped >= FAKE_THRESHOLD else "REAL"
+    def verdict_for(fake_prob):
+        return "FAKE" if fake_prob >= IMAGE_FAKE_THRESHOLD else "REAL"
 
     return {
-        "filename":           file.filename,
-        "raw_sigmoid":        round(raw, 6),
-        "preprocess_mode":    PREPROCESS_MODE,
-        "invert_sigmoid":     INVERT_SIGMOID,
-        "fake_prob_current":  round(fake_prob_current, 6),
-        "verdict_current":    verdict_current,
-        "fake_prob_if_flipped": round(fake_prob_flipped, 6),
-        "verdict_if_flipped": verdict_flipped,
-        "threshold":          FAKE_THRESHOLD,
+        "filename":             file.filename,
+        "raw_sigmoid":          round(raw, 6),
+        "img_size_used":        IMAGE_IMG_SIZE,
+        "preprocess_mode":      IMAGE_PREPROCESS_MODE,
+        "current_image_invert": IMAGE_INVERT_SIGMOID,
+        "not_inverted": {
+            "fake_prob": round(fake_prob_not_inverted, 6),
+            "verdict":   verdict_for(fake_prob_not_inverted),
+        },
+        "inverted": {
+            "fake_prob": round(fake_prob_inverted, 6),
+            "verdict":   verdict_for(fake_prob_inverted),
+        },
         "advice": (
-            "If verdict_current is wrong for a KNOWN real image, "
-            "set INVERT_SIGMOID=false in your .env and restart. "
-            "If verdict_if_flipped is also wrong, your model may need retraining "
-            "or the preprocessing mode may be incorrect (try PREPROCESS_MODE=divide255)."
+            "Upload a KNOWN real image. Whichever of 'not_inverted' or 'inverted' "
+            "gives the correct REAL verdict tells you the right IMAGE_INVERT_SIGMOID "
+            "setting for your .env."
         ),
     }
 
 
 @app.post("/analyse/image", response_model=AnalysisResponse)
 async def analyse_image(file: UploadFile = File(...)):
-    _require_model()
+    _require_models()
 
     if file.content_type not in SUPPORTED_IMAGE_TYPES:
         raise HTTPException(
@@ -405,7 +459,7 @@ async def analyse_image(file: UploadFile = File(...)):
 
 @app.post("/analyse/video", response_model=AnalysisResponse)
 async def analyse_video(file: UploadFile = File(...)):
-    _require_model()
+    _require_models()
 
     suffix = Path(file.filename or "upload.mp4").suffix.lower()
     if suffix not in VIDEO_EXTENSIONS:
@@ -455,14 +509,14 @@ async def analyse_video(file: UploadFile = File(...)):
         if not pil_frames:
             raise HTTPException(status_code=422, detail="Could not extract any frames.")
 
-        # ── Batch CNN inference ───────────────────────────────────────────────
+        # ── Batch CNN inference (video model) ─────────────────────────────────
         labels, confs, fake_probs = predict_cnn_batch(pil_frames)
 
         # ── Build per-frame results ───────────────────────────────────────────
         frame_results: list[FrameResult] = []
 
         for i, (lbl, conf, fake_p) in enumerate(zip(labels, confs, fake_probs)):
-            verdict     = "fake" if fake_p >= FAKE_THRESHOLD else "real"
+            verdict     = "fake" if fake_p >= VIDEO_FAKE_THRESHOLD else "real"
             explanation = _frame_explanation(verdict, fake_p, lbl, conf)
 
             frame_results.append(FrameResult(
