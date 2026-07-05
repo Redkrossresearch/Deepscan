@@ -116,6 +116,61 @@
     .size-error-toast svg { flex-shrink: 0; margin-top: 1px; }
     .size-error-toast b   { color: #ff6b6b; }
 
+    /* ── Server-offline restart banner ────────────────────
+       Shown when BOTH the API and CNN status dots are "off".
+       Sits above the messages list so it's impossible to miss,
+       and links out to the HF Space so the person can wake/
+       restart it themselves.
+    ──────────────────────────────────────────────────── */
+    .offline-restart-banner {
+      display: none;
+      align-items: flex-start;
+      gap: 10px;
+      background: rgba(234,67,53,0.08);
+      border: 1px solid rgba(234,67,53,0.30);
+      border-left: 3px solid #ea4335;
+      border-radius: 10px;
+      padding: 12px 14px;
+      margin: 12px 16px 0;
+      font-family: var(--font-ui);
+      font-size: 0.83rem;
+      color: #ff8a80;
+      line-height: 1.5;
+    }
+    .offline-restart-banner.visible { display: flex; }
+    .offline-restart-banner svg { flex-shrink: 0; margin-top: 1px; color: #ea4335; }
+    .offline-restart-banner b { color: #ff6b6b; }
+    .offline-restart-banner a {
+      color: #4285f4;
+      font-weight: 600;
+      text-decoration: underline;
+      text-decoration-color: rgba(66,133,244,0.4);
+    }
+    .offline-restart-banner a:hover { color: #8b5cf6; }
+
+    /* Small link under the sidebar status badges, same idea,
+       compact, visible even when the sidebar drawer is the
+       only thing on screen (mobile). */
+    .sidebar-restart-link {
+      display: none;
+      align-items: center;
+      gap: 6px;
+      margin-top: 8px;
+      padding: 7px 10px;
+      border-radius: 8px;
+      border: 1px solid rgba(234,67,53,0.30);
+      background: rgba(234,67,53,0.08);
+      color: #ff8a80;
+      font-family: var(--font-ui);
+      font-size: 0.72rem;
+      font-weight: 500;
+      text-decoration: none;
+      transition: background 0.2s;
+    }
+    .sidebar-restart-link.visible { display: flex; }
+    .sidebar-restart-link:hover { background: rgba(234,67,53,0.15); }
+    .sidebar-restart-link svg { flex-shrink: 0; }
+
     /* ────────────────────────────────────────────────────
        MOBILE OVERRIDES  (≤640px)
     ──────────────────────────────────────────────────── */
@@ -312,6 +367,17 @@
         <span class="status-dot dot-off"></span>
         <span class="status-text">CNN Offline</span>
       </div>
+
+      <!-- Shown automatically when both badges above go offline. -->
+      <a class="sidebar-restart-link" id="sidebar-restart-link"
+         href="https://huggingface.co/spaces/sanjay72005/Deepscan"
+         target="_blank" rel="noopener noreferrer">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21.5 2v6h-6M2.5 22v-6h6"/>
+          <path d="M2 11.5a10 10 0 0 1 18.5-4M22 12.5a10 10 0 0 1-18.5 4"/>
+        </svg>
+        <span>Server asleep — click to restart</span>
+      </a>
     </div>
   </aside>
 
@@ -358,6 +424,23 @@
 
     <!-- CHAT VIEW -->
     <div class="view active" id="view-chat">
+
+      <!-- Shown automatically when both the API and CNN badges go offline. -->
+      <div class="offline-restart-banner" id="offline-restart-banner">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="8" x2="12" y2="12"/>
+          <line x1="12" y1="16" x2="12.01" y2="16"/>
+        </svg>
+        <div>
+          <b>Server offline</b> — the CNN model and FastAPI backend are both unreachable.
+          Hugging Face Spaces put idle Spaces to sleep, so this usually just needs a wake-up.
+          <a href="https://huggingface.co/spaces/sanjay72005/Deepscan" target="_blank" rel="noopener noreferrer">
+            Click here to open the Space and restart it
+          </a>.
+        </div>
+      </div>
+
       <div class="messages" id="messages"></div>
 
       <div class="input-dock">
@@ -534,6 +617,23 @@
           </div>
         </div>
 
+        <div class="settings-card" style="border-color:rgba(234,67,53,0.15)">
+          <h3 class="settings-section-title">Server</h3>
+          <div style="display:flex;align-items:center;gap:10px;padding:10px 12px;background:rgba(234,67,53,0.06);border:1px solid rgba(234,67,53,0.15);border-radius:10px">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#ea4335" stroke-width="2">
+              <path d="M21.5 2v6h-6M2.5 22v-6h6"/>
+              <path d="M2 11.5a10 10 0 0 1 18.5-4M22 12.5a10 10 0 0 1-18.5 4"/>
+            </svg>
+            <div>
+              <div style="font-family:var(--font-ui);font-size:0.82rem;font-weight:600;color:var(--text)">Backend hosted on Hugging Face Spaces</div>
+              <div style="font-family:var(--font-ui);font-size:0.72rem;color:var(--text-3);margin-top:2px">
+                If the CNN or API status shows offline, the Space may be asleep.
+                <a href="https://huggingface.co/spaces/sanjay72005/Deepscan" target="_blank" rel="noopener noreferrer" style="color:#4285f4">Open the Space to restart it</a>.
+              </div>
+            </div>
+          </div>
+        </div>
+
         <div class="settings-card" style="border-color:rgba(66,133,244,0.12)">
           <h3 class="settings-section-title">Navigation</h3>
           <a href="./index.html" style="display:inline-flex;align-items:center;gap:8px;background:linear-gradient(135deg,rgba(66,133,244,0.1),rgba(139,92,246,0.08));border:1px solid rgba(66,133,244,0.2);border-radius:10px;padding:10px 16px;color:var(--accent-blue);text-decoration:none;font-family:var(--font-ui);font-size:0.83rem;font-weight:500;transition:all 0.2s;">
@@ -621,6 +721,42 @@
       // File is within the limit — delegate to app.js
       handleFile(file);
     }
+
+    // ── Offline / restart banner ────────────────────────────────
+    // app.js (not shown here) is what actually pings the backend and
+    // toggles the "dot-off" / "dot-on" classes on the two status dots
+    // in #api-status-badge and #cnn-status-badge. Rather than duplicate
+    // that health-check logic, this just watches those two dots and
+    // shows a "restart the server" link (to the HF Space) whenever
+    // BOTH are offline at the same time.
+    (function () {
+      var apiDot = document.querySelector('#api-status-badge .status-dot');
+      var cnnDot = document.querySelector('#cnn-status-badge .status-dot');
+      var banner = document.getElementById('offline-restart-banner');
+      var sidebarLink = document.getElementById('sidebar-restart-link');
+
+      function bothOffline() {
+        return apiDot && cnnDot &&
+               apiDot.classList.contains('dot-off') &&
+               cnnDot.classList.contains('dot-off');
+      }
+
+      function refresh() {
+        var offline = bothOffline();
+        banner.classList.toggle('visible', offline);
+        sidebarLink.classList.toggle('visible', offline);
+      }
+
+      if (apiDot && cnnDot) {
+        var observer = new MutationObserver(refresh);
+        observer.observe(apiDot, { attributes: true, attributeFilter: ['class'] });
+        observer.observe(cnnDot, { attributes: true, attributeFilter: ['class'] });
+        // Also re-check periodically in case app.js swaps the dot
+        // elements themselves rather than just their classes.
+        setInterval(refresh, 4000);
+        refresh();
+      }
+    })();
   </script>
 </body>
 </html>
